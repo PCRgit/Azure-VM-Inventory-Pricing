@@ -30,10 +30,6 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'
 
-# ----------------------------
-# Pricing cache / helpers
-# ----------------------------
-
 $script:PriceCache = @{}
 
 function Invoke-AzRetailPriceQuery {
@@ -77,14 +73,25 @@ function Get-AzRetailPrice {
     try {
         $encodedFilter = [System.Uri]::EscapeDataString($Filter)
         $uri = "https://prices.azure.com/api/retail/prices?api-version=2023-01-01-preview&currencyCode=$CurrencyCode&`$filter=$encodedFilter"
-        $resp = Invoke-AzRetailPriceQuery -Uri $uri
 
-        $items = @()
-        if ($resp -and $resp.Items) {
-            $items = @($resp.Items)
-        }
+        $allItems = New-Object System.Collections.Generic.List[object]
 
-        $item = $items |
+        do {
+            $resp = Invoke-AzRetailPriceQuery -Uri $uri
+
+            if ($resp -and $resp.Items) {
+                foreach ($item in @($resp.Items)) {
+                    $allItems.Add($item)
+                }
+            }
+
+            $uri = $null
+            if ($resp -and $resp.NextPageLink) {
+                $uri = $resp.NextPageLink
+            }
+        } while ($uri)
+
+        $item = @($allItems) |
             Where-Object {
                 $_.type -eq 'Consumption' -and
                 $_.meterName -notmatch 'Spot|Low Priority'
@@ -125,11 +132,11 @@ function Get-DiskTierLabel {
     )
 
     $family = switch -Regex ($DiskSkuName) {
-        'Premium'     { 'P'; break }
-        'StandardSSD' { 'E'; break }
-        'Standard_LRS' { 'S'; break }
-        'Ultra'       { 'U'; break }
-        default       { 'S' }
+        '^Premium'      { 'P'; break }
+        '^StandardSSD'  { 'E'; break }
+        '^Standard_LRS' { 'S'; break }
+        '^Ultra'        { 'U'; break }
+        default         { 'S' }
     }
 
     if ($family -eq 'U') {
@@ -137,20 +144,20 @@ function Get-DiskTierLabel {
     }
 
     $tierNumber = switch ($DiskSizeGB) {
-        { $_ -le 4 }     { 1; break }
-        { $_ -le 8 }     { 2; break }
-        { $_ -le 16 }    { 3; break }
-        { $_ -le 32 }    { 4; break }
-        { $_ -le 64 }    { 6; break }
-        { $_ -le 128 }   { 10; break }
-        { $_ -le 256 }   { 15; break }
-        { $_ -le 512 }   { 20; break }
-        { $_ -le 1024 }  { 30; break }
-        { $_ -le 2048 }  { 40; break }
-        { $_ -le 4096 }  { 50; break }
-        { $_ -le 8192 }  { 60; break }
-        { $_ -le 16384 } { 70; break }
-        default          { 80 }
+        { $_ -le 4 }      { 1; break }
+        { $_ -le 8 }      { 2; break }
+        { $_ -le 16 }     { 3; break }
+        { $_ -le 32 }     { 4; break }
+        { $_ -le 64 }     { 6; break }
+        { $_ -le 128 }    { 10; break }
+        { $_ -le 256 }    { 15; break }
+        { $_ -le 512 }    { 20; break }
+        { $_ -le 1024 }   { 30; break }
+        { $_ -le 2048 }   { 40; break }
+        { $_ -le 4096 }   { 50; break }
+        { $_ -le 8192 }   { 60; break }
+        { $_ -le 16384 }  { 70; break }
+        default           { 80 }
     }
 
     return "$family$tierNumber"
@@ -162,11 +169,11 @@ function Get-DiskProductName {
     )
 
     switch -Regex ($DiskSkuName) {
-        'Premium'     { 'Premium SSD Managed Disks'; break }
-        'StandardSSD' { 'Standard SSD Managed Disks'; break }
-        'Standard_LRS' { 'Standard HDD Managed Disks'; break }
-        'Ultra'       { 'Ultra Disks'; break }
-        default       { 'Standard HDD Managed Disks' }
+        '^Premium'      { 'Premium SSD Managed Disks'; break }
+        '^StandardSSD'  { 'Standard SSD Managed Disks'; break }
+        '^Standard_LRS' { 'Standard HDD Managed Disks'; break }
+        '^Ultra'        { 'Ultra Disks'; break }
+        default         { 'Standard HDD Managed Disks' }
     }
 }
 
@@ -184,11 +191,12 @@ function Get-DiskMonthlyPrice {
         return $null
     }
 
-    $skuName = "$tierLabel LRS"
+    $redundancy = 'LRS'
     if ($DiskSkuName -match 'ZRS') {
-        $skuName = "$tierLabel ZRS"
+        $redundancy = 'ZRS'
     }
 
+    $skuName = "$tierLabel $redundancy"
     $cacheKey = "DISK|$productName|$skuName|$Region|$CurrencyCode"
     $filter = "serviceFamily eq 'Storage' and armRegionName eq '$Region' and skuName eq '$skuName' and productName eq '$productName' and priceType eq 'Consumption'"
 
@@ -200,6 +208,10 @@ function Get-VMPowerState {
         [Parameter(Mandatory = $true)]$VmObject
     )
 
+    if ($VmObject.PSObject.Properties.Name -contains 'PowerState' -and $VmObject.PowerState) {
+        return $VmObject.PowerState
+    }
+
     $powerState = $null
 
     if ($VmObject.PSObject.Properties.Name -contains 'Statuses' -and $VmObject.Statuses) {
@@ -210,7 +222,11 @@ function Get-VMPowerState {
     if (-not $powerState) {
         try {
             $vmWithStatus = Get-AzVM -ResourceGroupName $VmObject.ResourceGroupName -Name $VmObject.Name -Status -ErrorAction Stop
-            if ($vmWithStatus.PSObject.Properties.Name -contains 'Statuses' -and $vmWithStatus.Statuses) {
+
+            if ($vmWithStatus.PSObject.Properties.Name -contains 'PowerState' -and $vmWithStatus.PowerState) {
+                $powerState = $vmWithStatus.PowerState
+            }
+            elseif ($vmWithStatus.PSObject.Properties.Name -contains 'Statuses' -and $vmWithStatus.Statuses) {
                 $statusList = @($vmWithStatus.Statuses)
                 $powerState = ($statusList | Where-Object { $_.Code -match 'PowerState' } | Select-Object -First 1).DisplayStatus
             }
@@ -240,9 +256,22 @@ function Get-SafeProperty {
     return $null
 }
 
-# ----------------------------
-# Collect inventory
-# ----------------------------
+function Get-ExcelColumnName {
+    param(
+        [Parameter(Mandatory = $true)][int]$ColumnNumber
+    )
+
+    $letters = ""
+    $dividend = $ColumnNumber
+
+    while ($dividend -gt 0) {
+        $modulo = ($dividend - 1) % 26
+        $letters = [char](65 + $modulo) + $letters
+        $dividend = [math]::Floor(($dividend - $modulo) / 26)
+    }
+
+    return $letters
+}
 
 $allVMs = New-Object System.Collections.Generic.List[object]
 $allDisks = New-Object System.Collections.Generic.List[object]
@@ -290,6 +319,10 @@ foreach ($sub in $subscriptions) {
         $acceleratedNetworking = $false
 
         foreach ($nicRef in @($vm.NetworkProfile.NetworkInterfaces)) {
+            if (-not $nicRef.Id) {
+                continue
+            }
+
             $nicIdParts = $nicRef.Id -split '/'
             $nicName = $nicIdParts[-1]
             $nicRg = $nicIdParts[4]
@@ -309,6 +342,7 @@ foreach ($sub in $subscriptions) {
 
                     if ($ipConfig.Subnet -and $ipConfig.Subnet.Id) {
                         $subnetIdParts = $ipConfig.Subnet.Id -split '/'
+
                         if ($subnetIdParts.Count -ge 11) {
                             $vnetNames.Add($subnetIdParts[8])
                             $subnetNames.Add($subnetIdParts[10])
@@ -324,6 +358,9 @@ foreach ($sub in $subscriptions) {
                             $pip = Get-AzPublicIpAddress -Name $pipName -ResourceGroupName $pipRg -ErrorAction Stop
                             if ($pip.IpAddress) {
                                 $publicIPs.Add($pip.IpAddress)
+                            }
+                            else {
+                                $publicIPs.Add('N/A')
                             }
                         }
                         catch {
@@ -396,22 +433,22 @@ foreach ($sub in $subscriptions) {
         }
 
         $allDisks.Add([PSCustomObject]@{
-            SubscriptionName      = $sub.Name
-            SubscriptionId        = $sub.Id
-            ResourceGroup         = $vm.ResourceGroupName
-            VMName                = $vm.Name
-            DiskName              = $osDisk.Name
-            DiskType              = 'OS Disk'
-            DiskSKU               = $osDiskSku
-            DiskSizeGB            = $osDiskSizeGB
-            Caching               = $osDisk.Caching
-            StorageAccountType    = $osDiskSku
-            ManagedDiskId         = $osDiskManagedId
-            LUN                   = $null
-            DiskState             = $osDiskState
-            EncryptionType        = $osDiskEncType
-            Region                = $region
-            EstMonthlyPrice_USD   = $osDiskPrice
+            SubscriptionName    = $sub.Name
+            SubscriptionId      = $sub.Id
+            ResourceGroup       = $vm.ResourceGroupName
+            VMName              = $vm.Name
+            DiskName            = $osDisk.Name
+            DiskType            = 'OS Disk'
+            DiskSKU             = $osDiskSku
+            DiskSizeGB          = $osDiskSizeGB
+            Caching             = $osDisk.Caching
+            StorageAccountType  = $osDiskSku
+            ManagedDiskId       = $osDiskManagedId
+            LUN                 = $null
+            DiskState           = $osDiskState
+            EncryptionType      = $osDiskEncType
+            Region              = $region
+            EstMonthlyPrice_USD = $osDiskPrice
         })
 
         foreach ($dataDisk in @($vm.StorageProfile.DataDisks)) {
@@ -455,22 +492,22 @@ foreach ($sub in $subscriptions) {
             }
 
             $allDisks.Add([PSCustomObject]@{
-                SubscriptionName      = $sub.Name
-                SubscriptionId        = $sub.Id
-                ResourceGroup         = $vm.ResourceGroupName
-                VMName                = $vm.Name
-                DiskName              = $dataDisk.Name
-                DiskType              = 'Data Disk'
-                DiskSKU               = $ddSku
-                DiskSizeGB            = $ddSizeGB
-                Caching               = $dataDisk.Caching
-                StorageAccountType    = $ddSku
-                ManagedDiskId         = $ddManagedId
-                LUN                   = $dataDisk.Lun
-                DiskState             = $ddState
-                EncryptionType        = $ddEncType
-                Region                = $region
-                EstMonthlyPrice_USD   = $ddPrice
+                SubscriptionName    = $sub.Name
+                SubscriptionId      = $sub.Id
+                ResourceGroup       = $vm.ResourceGroupName
+                VMName              = $vm.Name
+                DiskName            = $dataDisk.Name
+                DiskType            = 'Data Disk'
+                DiskSKU             = $ddSku
+                DiskSizeGB          = $ddSizeGB
+                Caching             = $dataDisk.Caching
+                StorageAccountType  = $ddSku
+                ManagedDiskId       = $ddManagedId
+                LUN                 = $dataDisk.Lun
+                DiskState           = $ddState
+                EncryptionType      = $ddEncType
+                Region              = $region
+                EstMonthlyPrice_USD = $ddPrice
             })
         }
 
@@ -509,50 +546,47 @@ foreach ($sub in $subscriptions) {
         }
 
         $allVMs.Add([PSCustomObject]@{
-            SubscriptionName         = $sub.Name
-            SubscriptionId           = $sub.Id
-            ResourceGroup            = $vm.ResourceGroupName
-            VMName                   = $vm.Name
-            PowerState               = $powerState
-            Location                 = $region
-            VMSize                   = $vmSku
-            OSType                   = $osDisk.OsType
-            OSPublisher              = $(if ($imageRef) { $imageRef.Publisher } else { $null })
-            OSOffer                  = $(if ($imageRef) { $imageRef.Offer } else { $null })
-            OSSKU                    = $(if ($imageRef) { $imageRef.Sku } else { $null })
-            OSVersion                = $(if ($imageRef) { $imageRef.Version } else { $null })
-            ComputerName             = $(if ($osProfile) { $osProfile.ComputerName } else { $null })
-            AdminUsername            = $(if ($osProfile) { $osProfile.AdminUsername } else { $null })
-            AvailabilitySet          = $availabilitySet
-            VirtualMachineScaleSet   = $vmssName
-            AvailabilityZone         = ($vm.Zones -join ',')
-            ProximityPlacementGroup  = $ppgName
-            LicenseType              = $vm.LicenseType
-            BootDiagnosticsEnabled   = $bootDiagEnabled
-            AcceleratedNetworking    = $acceleratedNetworking
-            NICNames                 = ($nicNames -join ', ')
-            PrivateIPAddresses       = ($privateIPs -join ', ')
-            PublicIPAddresses        = ($publicIPs -join ', ')
-            VNetNames                = (($vnetNames | Select-Object -Unique) -join ', ')
-            SubnetNames              = (($subnetNames | Select-Object -Unique) -join ', ')
-            NSGNames                 = (($nsgNames | Select-Object -Unique) -join ', ')
-            OSDiskName               = $osDisk.Name
-            OSDiskSizeGB             = $osDiskSizeGB
-            OSDiskSKU                = $osDiskSku
-            DataDiskCount            = @($vm.StorageProfile.DataDisks).Count
-            Tags                     = $tagString
-            VMHourlyPrice_USD        = $vmHourlyPrice
-            VMMonthlyPrice_USD       = $vmMonthlyPrice
-            EstTotalDiskCost_USD     = [math]::Round($diskSum, 4)
+            SubscriptionName        = $sub.Name
+            SubscriptionId          = $sub.Id
+            ResourceGroup           = $vm.ResourceGroupName
+            VMName                  = $vm.Name
+            PowerState              = $powerState
+            Location                = $region
+            VMSize                  = $vmSku
+            OSType                  = $osDisk.OsType
+            OSPublisher             = $(if ($imageRef) { $imageRef.Publisher } else { $null })
+            OSOffer                 = $(if ($imageRef) { $imageRef.Offer } else { $null })
+            OSSKU                   = $(if ($imageRef) { $imageRef.Sku } else { $null })
+            OSVersion               = $(if ($imageRef) { $imageRef.Version } else { $null })
+            ComputerName            = $(if ($osProfile) { $osProfile.ComputerName } else { $null })
+            AdminUsername           = $(if ($osProfile) { $osProfile.AdminUsername } else { $null })
+            AvailabilitySet         = $availabilitySet
+            VirtualMachineScaleSet  = $vmssName
+            AvailabilityZone        = ($vm.Zones -join ',')
+            ProximityPlacementGroup = $ppgName
+            LicenseType             = $vm.LicenseType
+            BootDiagnosticsEnabled  = $bootDiagEnabled
+            AcceleratedNetworking   = $acceleratedNetworking
+            NICNames                = ($nicNames -join ', ')
+            PrivateIPAddresses      = ($privateIPs -join ', ')
+            PublicIPAddresses       = ($publicIPs -join ', ')
+            VNetNames               = (($vnetNames | Select-Object -Unique) -join ', ')
+            SubnetNames             = (($subnetNames | Select-Object -Unique) -join ', ')
+            NSGNames                = (($nsgNames | Select-Object -Unique) -join ', ')
+            OSDiskName              = $osDisk.Name
+            OSDiskSizeGB            = $osDiskSizeGB
+            OSDiskSKU               = $osDiskSku
+            DataDiskCount           = @($vm.StorageProfile.DataDisks).Count
+            Tags                    = $tagString
+            VMHourlyPrice_USD       = $vmHourlyPrice
+            VMMonthlyPrice_USD      = $vmMonthlyPrice
+            EstTotalDiskCost_USD    = [math]::Round($diskSum, 4)
         })
 
-        Write-Host ("    ✓ {0} [{1}] | VM: ${2}/hr" -f $vm.Name, $vmSku, $(if ($null -ne $vmHourlyPrice) { $vmHourlyPrice } else { 'N/A' })) -ForegroundColor DarkGreen
+        $priceDisplay = if ($null -ne $vmHourlyPrice) { $vmHourlyPrice } else { 'N/A' }
+        Write-Host "    ✓ $($vm.Name) [$vmSku] | VM: `$$priceDisplay/hr" -ForegroundColor DarkGreen
     }
 }
-
-# ----------------------------
-# Build cost summary
-# ----------------------------
 
 $costSummary = foreach ($group in ($allVMs | Group-Object SubscriptionName)) {
     $subName = $group.Name
@@ -564,19 +598,15 @@ $costSummary = foreach ($group in ($allVMs | Group-Object SubscriptionName)) {
     $dataDiskCountMeasure = $grpVMs | Measure-Object -Property DataDiskCount -Sum
 
     [PSCustomObject]@{
-        SubscriptionName           = $subName
-        TotalVMs                   = $grpVMs.Count
-        RunningVMs                 = @($grpVMs | Where-Object { $_.PowerState -match 'running' }).Count
-        DeallocatedVMs             = @($grpVMs | Where-Object { $_.PowerState -match 'deallocated' }).Count
-        TotalDataDisks             = $(if ($null -ne $dataDiskCountMeasure.Sum) { [int]$dataDiskCountMeasure.Sum } else { 0 })
-        TotalVMCost_Monthly_USD    = [math]::Round($(if ($null -ne $vmCostMeasure.Sum) { [double]$vmCostMeasure.Sum } else { 0 }), 2)
-        TotalDiskCost_Monthly_USD  = [math]::Round($(if ($null -ne $diskCostMeasure.Sum) { [double]$diskCostMeasure.Sum } else { 0 }), 2)
+        SubscriptionName          = $subName
+        TotalVMs                  = $grpVMs.Count
+        RunningVMs                = @($grpVMs | Where-Object { $_.PowerState -match 'running' }).Count
+        DeallocatedVMs            = @($grpVMs | Where-Object { $_.PowerState -match 'deallocated' }).Count
+        TotalDataDisks            = $(if ($null -ne $dataDiskCountMeasure.Sum) { [int]$dataDiskCountMeasure.Sum } else { 0 })
+        TotalVMCost_Monthly_USD   = [math]::Round($(if ($null -ne $vmCostMeasure.Sum) { [double]$vmCostMeasure.Sum } else { 0 }), 2)
+        TotalDiskCost_Monthly_USD = [math]::Round($(if ($null -ne $diskCostMeasure.Sum) { [double]$diskCostMeasure.Sum } else { 0 }), 2)
     }
 }
-
-# ----------------------------
-# Export to Excel
-# ----------------------------
 
 Write-Host ""
 Write-Host "[INFO] Exporting to Excel: $OutputPath" -ForegroundColor Cyan
@@ -600,14 +630,7 @@ if ($allVMs.Count -gt 0) {
 
     if ($pwrIndex -ge 0) {
         $excelCol = $pwrIndex + 1
-        $letters = ""
-        $dividend = $excelCol
-        while ($dividend -gt 0) {
-            $modulo = ($dividend - 1) % 26
-            $letters = [char](65 + $modulo) + $letters
-            $dividend = [math]::Floor(($dividend - $modulo) / 26)
-        }
-
+        $letters = Get-ExcelColumnName -ColumnNumber $excelCol
         $lastRow = $allVMs.Count + 1
         $range = "$letters" + "2:" + "$letters" + "$lastRow"
 
