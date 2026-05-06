@@ -35,71 +35,59 @@
     Authenticate first:
       Connect-AzAccount -TenantId "<your-tenant-id>"
 #>
-
-#Requires -Modules Az.Accounts, Az.Compute, Az.Network, ImportExcel
-
 [CmdletBinding()]
 param(
-    [string]   $OutputPath            = "$env:USERPROFILE\Desktop\AzureVM_Inventory_$(Get-Date -Format 'yyyyMMdd_HHmmss').xlsx",
-    [string]   $CurrencyCode          = "USD",
-    [string[]] $ExcludeSubscriptions  = @(),
-    [string]   $TenantId              = ""
+    [string]   $OutputPath           = "$env:USERPROFILE\Desktop\AzureVM_Inventory_$(Get-Date -Format 'yyyyMMdd_HHmmss').xlsx",
+    [string]   $CurrencyCode         = "USD",
+    [string[]] $ExcludeSubscriptions = @(),
+    [string]   $TenantId             = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'
 
-# Load System.Web for proper URL encoding
 Add-Type -AssemblyName System.Web
 
 $script:PriceCache = @{}
 
-#region ── Pricing helpers ─────────────────────────────────────────────────────
+#region ── Pricing Helpers ─────────────────────────────────────────────────────
 
 function Build-PriceUrl {
     param([string]$Filter)
-    # Encode ONLY the filter value — keep $filter literal in the URL key
     $encodedFilter = [System.Web.HttpUtility]::UrlEncode($Filter)
     return "https://prices.azure.com/api/retail/prices?api-version=2023-01-01-preview&currencyCode=$CurrencyCode&`$filter=$encodedFilter"
 }
 
 function Invoke-RetailPriceRequest {
     param([string]$Uri)
-
     $maxRetries = 4
     $attempt    = 0
-
     do {
         try {
             return Invoke-RestMethod -Uri $Uri -Method Get -UseBasicParsing -ErrorAction Stop
-        } catch {
+        }
+        catch {
             $attempt++
             if ($_.Exception.Message -match '429|Too many requests' -and $attempt -lt $maxRetries) {
                 $wait = 5 * $attempt
-                Write-Warning "  Rate limited. Retrying in $wait sec (attempt $attempt of $maxRetries)..."
+                Write-Warning "  Rate limited. Retrying in $wait sec (attempt $attempt/$maxRetries)..."
                 Start-Sleep -Seconds $wait
-            } else { throw }
+            }
+            else { throw }
         }
     } while ($attempt -lt $maxRetries)
 }
 
 function Get-AzRetailPrice {
     param([string]$Filter, [string]$CacheKey)
-
-    if ($script:PriceCache.ContainsKey($CacheKey)) {
-        return $script:PriceCache[$CacheKey]
-    }
-
+    if ($script:PriceCache.ContainsKey($CacheKey)) { return $script:PriceCache[$CacheKey] }
     try {
         $uri      = Build-PriceUrl -Filter $Filter
         $allItems = [System.Collections.Generic.List[object]]::new()
-
         do {
             $resp = Invoke-RetailPriceRequest -Uri $uri
-            if ($resp -and $resp.Items) {
-                $resp.Items | ForEach-Object { $allItems.Add($_) }
-            }
-            $uri = if ($resp -and $resp.NextPageLink -and $resp.NextPageLink -ne '') { $resp.NextPageLink } else { $null }
+            if ($resp -and $resp.Items) { $resp.Items | ForEach-Object { $allItems.Add($_) } }
+            $uri  = if ($resp -and $resp.NextPageLink -and $resp.NextPageLink -ne '') { $resp.NextPageLink } else { $null }
         } while ($uri)
 
         $item = @($allItems) |
@@ -110,7 +98,8 @@ function Get-AzRetailPrice {
         $price = if ($item) { [math]::Round([double]$item.retailPrice, 6) } else { $null }
         $script:PriceCache[$CacheKey] = $price
         return $price
-    } catch {
+    }
+    catch {
         Write-Warning "  Pricing API error [$CacheKey]: $($_.Exception.Message)"
         $script:PriceCache[$CacheKey] = $null
         return $null
@@ -126,12 +115,10 @@ function Get-VMHourlyPrice {
 
 function Get-DiskTierLabel {
     param([string]$DiskSkuName, [int]$DiskSizeGB)
-
     if ($DiskSkuName -match '^Ultra')        { return 'Ultra' }
-    if ($DiskSkuName -match '^Premium')       { $f = 'P' }
+    if ($DiskSkuName -match '^Premium')      { $f = 'P' }
     elseif ($DiskSkuName -match '^StandardSSD') { $f = 'E' }
-    else                                         { $f = 'S' }
-
+    else                                     { $f = 'S' }
     $n = switch ($DiskSizeGB) {
         { $_ -le 4    } { 1;  break }
         { $_ -le 8    } { 2;  break }
@@ -153,32 +140,27 @@ function Get-DiskTierLabel {
 
 function Get-DiskMonthlyPrice {
     param([string]$DiskSkuName, [string]$Region, [int]$DiskSizeGB)
-
     $tier = Get-DiskTierLabel -DiskSkuName $DiskSkuName -DiskSizeGB $DiskSizeGB
     if ($tier -eq 'Ultra') { return $null }
-
     $productName = switch -Regex ($DiskSkuName) {
-        '^Premium'      { 'Premium SSD Managed Disks';  break }
-        '^StandardSSD'  { 'Standard SSD Managed Disks'; break }
-        '^Ultra'        { 'Ultra Disks';                break }
-        default         { 'Standard HDD Managed Disks' }
+        '^Premium'     { 'Premium SSD Managed Disks';  break }
+        '^StandardSSD' { 'Standard SSD Managed Disks'; break }
+        '^Ultra'       { 'Ultra Disks';                break }
+        default        { 'Standard HDD Managed Disks' }
     }
-
     $redundancy = if ($DiskSkuName -match 'ZRS') { 'ZRS' } else { 'LRS' }
     $skuName    = "$tier $redundancy"
     $key        = "DISK|$productName|$skuName|$Region|$CurrencyCode"
     $filter     = "serviceFamily eq 'Storage' and armRegionName eq '$Region' and skuName eq '$skuName' and productName eq '$productName' and priceType eq 'Consumption'"
-
     return Get-AzRetailPrice -Filter $filter -CacheKey $key
 }
 
 #endregion
 
-#region ── VM helpers ──────────────────────────────────────────────────────────
+#region ── VM / Utility Helpers ────────────────────────────────────────────────
 
 function Get-VMPowerState {
     param($VmObject)
-
     if ($VmObject.PSObject.Properties.Name -contains 'PowerState' -and $VmObject.PowerState) {
         return $VmObject.PowerState
     }
@@ -189,7 +171,7 @@ function Get-VMPowerState {
     try {
         $s = Get-AzVM -ResourceGroupName $VmObject.ResourceGroupName -Name $VmObject.Name -Status -ErrorAction Stop
         if ($s.PSObject.Properties.Name -contains 'PowerState' -and $s.PowerState) { return $s.PowerState }
-        if ($s.Statuses) {
+        if ($s.PSObject.Properties.Name -contains 'Statuses' -and $s.Statuses) {
             $ps = (@($s.Statuses) | Where-Object { $_.Code -match 'PowerState' } | Select-Object -First 1).DisplayStatus
             if ($ps) { return $ps }
         }
@@ -205,18 +187,19 @@ function Get-SafeProp {
 
 function Get-ExcelColumn {
     param([int]$Col)
-    $s = ""; $d = $Col
+    $s = ""
+    $d = [int]$Col
     while ($d -gt 0) {
-        $m = ($d - 1) % 26
-        $s = [char](65 + $m) + $s
-        $d = [math]::Floor(($d - $m) / 26)
+        $m = [int](($d - 1) % 26)
+        $s = [string][char](65 + $m) + $s
+        $d = [int][math]::Floor(($d - $m) / 26)
     }
     return $s
 }
 
 #endregion
 
-#region ── Resolve tenant + subscriptions ──────────────────────────────────────
+#region ── Resolve Tenant + Subscriptions ──────────────────────────────────────
 
 if (-not $TenantId) {
     $ctx = Get-AzContext -ErrorAction SilentlyContinue
@@ -239,7 +222,7 @@ Write-Host "[INFO] Found $($subscriptions.Count) enabled subscription(s).`n" -Fo
 
 #endregion
 
-#region ── Inventory collection ────────────────────────────────────────────────
+#region ── Inventory Collection ────────────────────────────────────────────────
 
 $allVMs   = [System.Collections.Generic.List[object]]::new()
 $allDisks = [System.Collections.Generic.List[object]]::new()
@@ -251,7 +234,8 @@ foreach ($sub in $subscriptions) {
 
     try {
         Set-AzContext -SubscriptionId $sub.Id -TenantId $TenantId -ErrorAction Stop | Out-Null
-    } catch {
+    }
+    catch {
         Write-Warning "  Skipping — cannot set context: $($_.Exception.Message)"
         continue
     }
@@ -265,6 +249,7 @@ foreach ($sub in $subscriptions) {
     Write-Host "  Found $($vms.Count) VM(s)." -ForegroundColor Green
 
     foreach ($vm in $vms) {
+
         $powerState = Get-VMPowerState -VmObject $vm
 
         $nicNames    = [System.Collections.Generic.List[string]]::new()
@@ -284,15 +269,12 @@ foreach ($sub in $subscriptions) {
                 $nic = Get-AzNetworkInterface -Name $nicN -ResourceGroupName $nicG -ErrorAction Stop
                 $nicNames.Add($nic.Name)
                 if ($nic.EnableAcceleratedNetworking) { $accelNet = $true }
-
                 foreach ($ip in @($nic.IpConfigurations)) {
                     if ($ip.PrivateIpAddress) { $privateIPs.Add($ip.PrivateIpAddress) }
-
                     if ($ip.Subnet -and $ip.Subnet.Id) {
                         $sp = $ip.Subnet.Id -split '/'
                         if ($sp.Count -ge 11) { $vnetNames.Add($sp[8]); $subnetNames.Add($sp[10]) }
                     }
-
                     if ($ip.PublicIpAddress -and $ip.PublicIpAddress.Id) {
                         $pp = $ip.PublicIpAddress.Id -split '/'
                         try {
@@ -301,22 +283,18 @@ foreach ($sub in $subscriptions) {
                         } catch { $publicIPs.Add('N/A') }
                     }
                 }
-
                 if ($nic.NetworkSecurityGroup -and $nic.NetworkSecurityGroup.Id) {
                     $nsgNames.Add(($nic.NetworkSecurityGroup.Id -split '/')[-1])
                 }
-            } catch {
-                Write-Warning "  NIC '$nicN': $($_.Exception.Message)"
             }
+            catch { Write-Warning "  NIC '$nicN': $($_.Exception.Message)" }
         }
 
         $region         = $vm.Location
         $vmSku          = $vm.HardwareProfile.VmSize
         $vmHourlyPrice  = Get-VMHourlyPrice -SkuName $vmSku -Region $region
         $vmMonthlyPrice = $null
-        if ($null -ne $vmHourlyPrice) {
-            $vmMonthlyPrice = [math]::Round([double]$vmHourlyPrice * 730, 2)
-        }
+        if ($null -ne $vmHourlyPrice) { $vmMonthlyPrice = [math]::Round([double]$vmHourlyPrice * 730, 2) }
 
         $tagString = ''
         if ($vm.Tags) {
@@ -336,9 +314,8 @@ foreach ($sub in $subscriptions) {
         if ($osDisk.ManagedDisk -and $osDisk.ManagedDisk.Id) {
             $osDiskMgdId = $osDisk.ManagedDisk.Id
             $dp = $osDisk.ManagedDisk.Id -split '/'
-            try {
-                $osDiskRes = Get-AzDisk -ResourceGroupName $dp[4] -DiskName $dp[-1] -ErrorAction Stop
-            } catch { $osDiskRes = $null }
+            try { $osDiskRes = Get-AzDisk -ResourceGroupName $dp[4] -DiskName $dp[-1] -ErrorAction Stop }
+            catch { $osDiskRes = $null }
         }
 
         if ($osDiskRes) {
@@ -385,9 +362,8 @@ foreach ($sub in $subscriptions) {
             if ($dd.ManagedDisk -and $dd.ManagedDisk.Id) {
                 $ddMgdId = $dd.ManagedDisk.Id
                 $dp = $dd.ManagedDisk.Id -split '/'
-                try {
-                    $ddRes = Get-AzDisk -ResourceGroupName $dp[4] -DiskName $dp[-1] -ErrorAction Stop
-                } catch { $ddRes = $null }
+                try { $ddRes = Get-AzDisk -ResourceGroupName $dp[4] -DiskName $dp[-1] -ErrorAction Stop }
+                catch { $ddRes = $null }
             }
 
             if ($ddRes) {
@@ -422,11 +398,10 @@ foreach ($sub in $subscriptions) {
             })
         }
 
-        # ── Compute VM row totals ──────────────────────────────────
+        # ── VM row ─────────────────────────────────────────────────
         $vmDiskRows = @($allDisks | Where-Object { $_.VMName -eq $vm.Name -and $_.SubscriptionId -eq $sub.Id })
-        $diskSum = 0
-        $m = $vmDiskRows | Measure-Object -Property EstMonthlyPrice_USD -Sum
-        if ($m -and $null -ne $m.Sum) { $diskSum = [double]$m.Sum }
+        $diskMeasure = $vmDiskRows | Measure-Object -Property EstMonthlyPrice_USD -Sum
+        $diskSum = if ($diskMeasure -and $null -ne $diskMeasure.Sum) { [double]$diskMeasure.Sum } else { 0 }
 
         $imgRef   = $vm.StorageProfile.ImageReference
         $osProf   = $vm.OSProfile
@@ -436,9 +411,12 @@ foreach ($sub in $subscriptions) {
             $bootDiag = [bool]$diagProf.BootDiagnostics.Enabled
         }
 
-        $availSet = $null; if ($vm.AvailabilitySetReference -and $vm.AvailabilitySetReference.Id) { $availSet = ($vm.AvailabilitySetReference.Id -split '/')[-1] }
-        $vmssRef  = $null; if ($vm.VirtualMachineScaleSet -and $vm.VirtualMachineScaleSet.Id)   { $vmssRef  = ($vm.VirtualMachineScaleSet.Id -split '/')[-1]  }
-        $ppgRef   = $null; if ($vm.ProximityPlacementGroup -and $vm.ProximityPlacementGroup.Id) { $ppgRef   = ($vm.ProximityPlacementGroup.Id -split '/')[-1]  }
+        $availSet = $null
+        if ($vm.AvailabilitySetReference -and $vm.AvailabilitySetReference.Id) { $availSet = ($vm.AvailabilitySetReference.Id -split '/')[-1] }
+        $vmssRef = $null
+        if ($vm.VirtualMachineScaleSet -and $vm.VirtualMachineScaleSet.Id) { $vmssRef = ($vm.VirtualMachineScaleSet.Id -split '/')[-1] }
+        $ppgRef = $null
+        if ($vm.ProximityPlacementGroup -and $vm.ProximityPlacementGroup.Id) { $ppgRef = ($vm.ProximityPlacementGroup.Id -split '/')[-1] }
 
         $allVMs.Add([PSCustomObject]@{
             SubscriptionName        = $sub.Name
@@ -489,19 +467,14 @@ foreach ($sub in $subscriptions) {
 #region ── Cost Summary ────────────────────────────────────────────────────────
 
 $costSummary = foreach ($grp in ($allVMs | Group-Object SubscriptionName)) {
-    $sn      = $grp.Name
-    $gvms    = @($grp.Group)
-    $gdisks  = @($allDisks | Where-Object { $_.SubscriptionName -eq $sn })
+    $sn     = $grp.Name
+    $gvms   = @($grp.Group)
+    $gdisks = @($allDisks | Where-Object { $_.SubscriptionName -eq $sn })
 
-    $mVM    = $gvms   | Measure-Object -Property VMMonthlyPrice_USD   -Sum
-    $mDisk  = $gdisks | Measure-Object -Property EstMonthlyPrice_USD  -Sum
+    $mVM    = $gvms   | Measure-Object -Property VMMonthlyPrice_USD      -Sum
+    $mDisk  = $gdisks | Measure-Object -Property EstMonthlyPrice_USD     -Sum
     $mTotal = $gvms   | Measure-Object -Property EstTotalMonthlyCost_USD -Sum
-    $mDD    = $gvms   | Measure-Object -Property DataDiskCount         -Sum
-
-    $vmCost    = if ($null -ne $mVM.Sum)    { [math]::Round([double]$mVM.Sum,    2) } else { 0 }
-    $diskCost  = if ($null -ne $mDisk.Sum)  { [math]::Round([double]$mDisk.Sum,  2) } else { 0 }
-    $totalCost = if ($null -ne $mTotal.Sum) { [math]::Round([double]$mTotal.Sum, 2) } else { 0 }
-    $ddCount   = if ($null -ne $mDD.Sum)    { [int]$mDD.Sum } else { 0 }
+    $mDD    = $gvms   | Measure-Object -Property DataDiskCount            -Sum
 
     [PSCustomObject]@{
         SubscriptionName          = $sn
@@ -509,16 +482,16 @@ $costSummary = foreach ($grp in ($allVMs | Group-Object SubscriptionName)) {
         RunningVMs                = @($gvms | Where-Object { $_.PowerState -match 'running' }).Count
         DeallocatedVMs            = @($gvms | Where-Object { $_.PowerState -match 'deallocated' }).Count
         StoppedVMs                = @($gvms | Where-Object { $_.PowerState -match '^VM stopped$' }).Count
-        TotalDataDisks            = $ddCount
-        VMComputeCost_Monthly_USD = $vmCost
-        DiskCost_Monthly_USD      = $diskCost
-        TotalCost_Monthly_USD     = $totalCost
+        TotalDataDisks            = $(if ($null -ne $mDD.Sum)    { [int]$mDD.Sum }                    else { 0 })
+        VMComputeCost_Monthly_USD = [math]::Round($(if ($null -ne $mVM.Sum)    { [double]$mVM.Sum }    else { 0 }), 2)
+        DiskCost_Monthly_USD      = [math]::Round($(if ($null -ne $mDisk.Sum)  { [double]$mDisk.Sum }  else { 0 }), 2)
+        TotalCost_Monthly_USD     = [math]::Round($(if ($null -ne $mTotal.Sum) { [double]$mTotal.Sum } else { 0 }), 2)
     }
 }
 
 #endregion
 
-#region ── Excel Export (Improved) ────────────────────────────────────────────
+#region ── Excel Export ────────────────────────────────────────────────────────
 
 Write-Host "`n[INFO] Exporting to Excel: $OutputPath" -ForegroundColor Cyan
 
@@ -531,38 +504,35 @@ $excelPkg = $allVMs | Export-Excel `
     -TableStyle    'Medium9' `
     -PassThru
 
-$ws = $excelPkg.Workbook.Worksheets['VM Inventory']
+$wsVM = $excelPkg.Workbook.Worksheets['VM Inventory']
 
 if ($allVMs.Count -gt 0) {
     $headers = @($allVMs[0].PSObject.Properties.Name)
     $lastRow = $allVMs.Count + 1
 
-    # Power State — color coding
+    # Power state color coding
     $pwrIdx = [array]::IndexOf($headers, 'PowerState')
     if ($pwrIdx -ge 0) {
-        $col   = Get-ExcelColumn -Col ($pwrIdx + 1)
+        $col   = Get-ExcelColumn -Col ([int]($pwrIdx + 1))
         $range = "${col}2:${col}${lastRow}"
-        Add-ConditionalFormatting -Worksheet $ws -Address $range -RuleType ContainsText -ConditionValue 'running'     -BackgroundColor ([System.Drawing.Color]::LightGreen)
-        Add-ConditionalFormatting -Worksheet $ws -Address $range -RuleType ContainsText -ConditionValue 'deallocated' -BackgroundColor ([System.Drawing.Color]::LightCoral)
-        Add-ConditionalFormatting -Worksheet $ws -Address $range -RuleType ContainsText -ConditionValue 'stopped'     -BackgroundColor ([System.Drawing.Color]::LightYellow)
-        Add-ConditionalFormatting -Worksheet $ws -Address $range -RuleType ContainsText -ConditionValue 'Unknown'     -BackgroundColor ([System.Drawing.Color]::LightGray)
+        Add-ConditionalFormatting -Worksheet $wsVM -Address $range -RuleType ContainsText -ConditionValue 'running'     -BackgroundColor ([System.Drawing.Color]::LightGreen)
+        Add-ConditionalFormatting -Worksheet $wsVM -Address $range -RuleType ContainsText -ConditionValue 'deallocated' -BackgroundColor ([System.Drawing.Color]::LightCoral)
+        Add-ConditionalFormatting -Worksheet $wsVM -Address $range -RuleType ContainsText -ConditionValue 'stopped'     -BackgroundColor ([System.Drawing.Color]::LightYellow)
+        Add-ConditionalFormatting -Worksheet $wsVM -Address $range -RuleType ContainsText -ConditionValue 'Unknown'     -BackgroundColor ([System.Drawing.Color]::LightGray)
     }
 
-    # Format currency columns with $ number format
-    foreach ($col in @('VMHourlyPrice_USD','VMMonthlyPrice_USD','EstTotalDiskCost_USD','EstTotalMonthlyCost_USD')) {
-        $idx = [array]::IndexOf($headers, $col)
-        if ($idx -ge 0) {
-            $colLetter = Get-ExcelColumn -Col ($idx + 1)
-            $ws.Column($idx + 1).Style.Numberformat.Format = '$#,##0.0000'
-        }
+    # Currency format on all price columns
+    foreach ($pCol in @('VMHourlyPrice_USD','VMMonthlyPrice_USD','EstTotalDiskCost_USD','EstTotalMonthlyCost_USD')) {
+        $idx = [array]::IndexOf($headers, $pCol)
+        if ($idx -ge 0) { $wsVM.Column([int]($idx + 1)).Style.Numberformat.Format = '$#,##0.0000' }
     }
 
-    # Highlight high-cost VMs (monthly total > $1000) in orange
-    $totalIdx = [array]::IndexOf($headers, 'EstTotalMonthlyCost_USD')
-    if ($totalIdx -ge 0) {
-        $col   = Get-ExcelColumn -Col ($totalIdx + 1)
+    # Highlight VMs costing > $1,000/month in orange
+    $tcIdx = [array]::IndexOf($headers, 'EstTotalMonthlyCost_USD')
+    if ($tcIdx -ge 0) {
+        $col   = Get-ExcelColumn -Col ([int]($tcIdx + 1))
         $range = "${col}2:${col}${lastRow}"
-        Add-ConditionalFormatting -Worksheet $ws -Address $range -RuleType GreaterThan -ConditionValue 1000 -BackgroundColor ([System.Drawing.Color]::FromArgb(255, 200, 100))
+        Add-ConditionalFormatting -Worksheet $wsVM -Address $range -RuleType GreaterThan -ConditionValue 1000 -BackgroundColor ([System.Drawing.Color]::FromArgb(255, 200, 100))
     }
 }
 
@@ -576,33 +546,30 @@ $excelPkg = $allDisks | Export-Excel `
     -PassThru
 
 $wsDisk = $excelPkg.Workbook.Worksheets['Disk Inventory']
-
 if ($allDisks.Count -gt 0) {
     $dHeaders = @($allDisks[0].PSObject.Properties.Name)
     $dLastRow = $allDisks.Count + 1
 
-    # Color disk type column
+    # Color OS vs Data disk rows
     $dtIdx = [array]::IndexOf($dHeaders, 'DiskType')
     if ($dtIdx -ge 0) {
-        $col   = Get-ExcelColumn -Col ($dtIdx + 1)
+        $col   = Get-ExcelColumn -Col ([int]($dtIdx + 1))
         $range = "${col}2:${col}${dLastRow}"
         Add-ConditionalFormatting -Worksheet $wsDisk -Address $range -RuleType ContainsText -ConditionValue 'OS Disk'   -BackgroundColor ([System.Drawing.Color]::LightSteelBlue)
         Add-ConditionalFormatting -Worksheet $wsDisk -Address $range -RuleType ContainsText -ConditionValue 'Data Disk' -BackgroundColor ([System.Drawing.Color]::LightCyan)
     }
 
-    # Format disk price column
-    $dpIdx = [array]::IndexOf($dHeaders, 'EstMonthlyPrice_USD')
-    if ($dpIdx -ge 0) {
-        $wsDisk.Column($dpIdx + 1).Style.Numberformat.Format = '$#,##0.00'
-    }
-
-    # Color DiskState column
+    # Highlight unattached disks red
     $dsIdx = [array]::IndexOf($dHeaders, 'DiskState')
     if ($dsIdx -ge 0) {
-        $col   = Get-ExcelColumn -Col ($dsIdx + 1)
+        $col   = Get-ExcelColumn -Col ([int]($dsIdx + 1))
         $range = "${col}2:${col}${dLastRow}"
         Add-ConditionalFormatting -Worksheet $wsDisk -Address $range -RuleType ContainsText -ConditionValue 'Unattached' -BackgroundColor ([System.Drawing.Color]::LightCoral)
     }
+
+    # Currency format on price column
+    $dpIdx = [array]::IndexOf($dHeaders, 'EstMonthlyPrice_USD')
+    if ($dpIdx -ge 0) { $wsDisk.Column([int]($dpIdx + 1)).Style.Numberformat.Format = '$#,##0.00' }
 }
 
 # ── Sheet 3: Cost Summary ─────────────────────────────────────────────────────
@@ -615,22 +582,20 @@ $excelPkg = $costSummary | Export-Excel `
     -PassThru
 
 $wsSum = $excelPkg.Workbook.Worksheets['Cost Summary']
+$sumArr = @($costSummary)
+if ($sumArr.Count -gt 0) {
+    $sHeaders = @($sumArr[0].PSObject.Properties.Name)
+    $sLastRow = $sumArr.Count + 1
 
-if (@($costSummary).Count -gt 0) {
-    $sHeaders = @(@($costSummary)[0].PSObject.Properties.Name)
-    $sLastRow = @($costSummary).Count + 1
-
-    foreach ($col in @('VMComputeCost_Monthly_USD','DiskCost_Monthly_USD','TotalCost_Monthly_USD')) {
-        $idx = [array]::IndexOf($sHeaders, $col)
-        if ($idx -ge 0) {
-            $wsSum.Column($idx + 1).Style.Numberformat.Format = '$#,##0.00'
-        }
+    foreach ($pCol in @('VMComputeCost_Monthly_USD','DiskCost_Monthly_USD','TotalCost_Monthly_USD')) {
+        $idx = [array]::IndexOf($sHeaders, $pCol)
+        if ($idx -ge 0) { $wsSum.Column([int]($idx + 1)).Style.Numberformat.Format = '$#,##0.00' }
     }
 
-    # Highlight total cost column with data bars
-    $tcIdx = [array]::IndexOf($sHeaders, 'TotalCost_Monthly_USD')
-    if ($tcIdx -ge 0) {
-        $col   = Get-ExcelColumn -Col ($tcIdx + 1)
+    # Data bars on total cost
+    $tcIdx3 = [array]::IndexOf($sHeaders, 'TotalCost_Monthly_USD')
+    if ($tcIdx3 -ge 0) {
+        $col   = Get-ExcelColumn -Col ([int]($tcIdx3 + 1))
         $range = "${col}2:${col}${sLastRow}"
         Add-ConditionalFormatting -Worksheet $wsSum -Address $range -DataBarColor ([System.Drawing.Color]::SteelBlue)
     }
@@ -639,8 +604,11 @@ if (@($costSummary).Count -gt 0) {
 Close-ExcelPackage $excelPkg
 
 Write-Host "`n[DONE] Report saved to: $OutputPath" -ForegroundColor Green
-Write-Host "  VM Inventory   : $($allVMs.Count) VM(s)"          -ForegroundColor White
-Write-Host "  Disk Inventory : $($allDisks.Count) disk(s)"      -ForegroundColor White
-Write-Host "  Cost Summary   : $(@($costSummary).Count) sub(s)" -ForegroundColor White
+Write-Host "  VM Inventory   : $($allVMs.Count) VM(s)"            -ForegroundColor White
+Write-Host "  Disk Inventory : $($allDisks.Count) disk(s)"        -ForegroundColor White
+Write-Host "  Cost Summary   : $(@($costSummary).Count) sub(s)"   -ForegroundColor White
+
+# Expose collections for downstream use (e.g. dashboard script)
+Write-Host "`n[INFO] `$allVMs and `$allDisks are available in session for dashboard export." -ForegroundColor DarkCyan
 
 #endregion
